@@ -66,6 +66,22 @@
   返回原判定，改范围/换设备 409；与上传/归档共用写锁串行点，已保存结果
   不会引用半个范围，且批次随后归档不影响已保存来源的复核。
 
+已登记消费者的批次处理租约（替代下游自行挑批次，避免多个处理进程重复
+读取同一设备链）：
+
+- ``batch_leases``：租约元数据——全局唯一幂等键、设备、消费者、领取时的
+  连续区间 ``from_sequence..to_sequence``、有效期（秒）、创建/过期/完成/
+  回收时刻与状态（``active`` / ``completed`` / ``recycled``）。部分唯一
+  索引保证每个 (设备, 消费者) 至多一个 ``active`` 租约；
+- ``batch_lease_batches``：租约内每批的摘要（序号、batch_id、前序/本批
+  摘要、条数）。领取在单个 BEGIN IMMEDIATE 事务内从该消费者连续水位的下
+  一批起选择至多 20 个**未归档连续区间**，保存租约与各批摘要并返回观测
+  明细；同消费者有未过期租约时同键重试返回原租约、其他键 409。完成租约
+  在同一事务内逐项核对摘要（摘要变化/缺批次/租约过期整体拒绝且不推进），
+  写入稀疏确认、推进水位并把租约置为 ``completed``。归档不得清除仍被
+  ``active`` 租约占用的明细（即使已过期，未显式回收前仍占用）；过期租约
+  可显式回收（``recycled``）后重新领取。
+
 设备链一致性核验（离线补传、归档或迁移后的运维核对）：
 
 - ``verify_chain`` 在**单个只读事务**（``PRAGMA query_only`` 兜底）内固定
@@ -246,6 +262,43 @@ CREATE TABLE IF NOT EXISTS batch_judgment_batches (
     observation_count INTEGER NOT NULL,
     UNIQUE (batch_judgment_id, sequence)
 );
+CREATE TABLE IF NOT EXISTS batch_leases (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    device_id       TEXT NOT NULL,
+    consumer_id     TEXT NOT NULL,
+    from_sequence   INTEGER NOT NULL,
+    to_sequence     INTEGER NOT NULL,
+    lease_seconds   INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'completed', 'recycled')),
+    created_at      REAL NOT NULL,
+    expires_at      REAL NOT NULL,
+    completed_at    REAL,
+    recycled_at     REAL
+);
+-- 每个 (设备, 消费者) 至多存在一个未终结（active）租约：完成或回收后才允许
+-- 领取下一个。部分唯一索引兜底并发，保证同一区间绝不会分给两个租约。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_batch_leases_single_active
+    ON batch_leases (device_id, consumer_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_batch_leases_device
+    ON batch_leases (device_id, id);
+CREATE TABLE IF NOT EXISTS batch_lease_batches (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    lease_id          INTEGER NOT NULL REFERENCES batch_leases(id),
+    sequence          INTEGER NOT NULL,
+    batch_id          TEXT NOT NULL,
+    previous_digest   TEXT NOT NULL,
+    digest            TEXT NOT NULL,
+    observation_count INTEGER NOT NULL,
+    UNIQUE (lease_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_lease_batches_lease
+    ON batch_lease_batches (lease_id, sequence);
+-- 租约占用：任何未终结（active，含已过期但未显式回收）的租约都继续占用
+-- (device, sequence)；归档据此跳过仍被租约占用的明细，区间绝不重复分配。
+CREATE INDEX IF NOT EXISTS idx_lease_batches_sequence
+    ON batch_lease_batches (lease_id, sequence);
 """
 
 
@@ -350,6 +403,19 @@ class ChainVerificationNotFound(Exception):
         super().__init__(message)
         self.detail = {"error": error, "message": message}
         self.detail.update(extra)
+
+
+class LeaseConflict(Exception):
+    """批次处理租约冲突（HTTP 409），detail 附冲突原因与租约上下文。"""
+
+    def __init__(self, *, message: str, **extra):
+        super().__init__(message)
+        self.detail = {"error": "lease_conflict", "message": message}
+        self.detail.update(extra)
+
+
+class LeaseNotFound(Exception):
+    """租约不存在或不属于该设备（HTTP 404）。"""
 
 
 def _iso(ts: float | None) -> str | None:
@@ -1440,6 +1506,28 @@ class Database:
                     fields=fields,
                 ), False
 
+            # 归档不得清除仍被未终结租约占用的明细：任何 active 租约
+            # （含已过期但尚未显式回收）覆盖待归档区间即拒绝，附占用租约。
+            occupied = self._active_lease_overlap(
+                conn, device_id, archived_through + 1, through_sequence
+            )
+            if occupied:
+                raise ArchiveConflict(
+                    message=(
+                        f"cannot archive through sequence {through_sequence}: "
+                        f"{len(occupied)} active lease(s) still occupy batches in the "
+                        "archive range; complete or recycle them first"
+                    ),
+                    reason="leases_occupying_batches",
+                    requested_through=through_sequence,
+                    safe_sequence=safe_sequence,
+                    archived_through=archived_through,
+                    head_sequence=head_sequence,
+                    first_gap=fields["first_gap"],
+                    blocking_consumers=fields["blocking_consumers"],
+                    occupied_leases=occupied,
+                )
+
             if through_sequence > safe_sequence:
                 raise ArchiveConflict(
                     message=(
@@ -1517,6 +1605,643 @@ class Database:
             "first_gap": fields["safe_sequence"] + 1,
             "blocking_consumers": fields["blocking_consumers"],
             "consumers": fields["consumers"],
+        }
+
+    # ---------------- 已登记消费者批次处理租约 ----------------
+
+    @staticmethod
+    def _save_acks_and_advance(conn, device_id: str, consumer_id: str, sequences, now: float):
+        """在给定写事务内为给定序号集合写入稀疏确认（已存在则幂等跳过），
+        并把该消费者的连续水位推进至首个缺口。
+
+        调用前必须已逐批核对摘要与存在性（摘要不符应直接抛
+        :class:`LeaseConflict`，本方法不重复核对）。完成租约与逐批确认
+        共用同一推进逻辑：``INSERT OR IGNORE`` 保证并发/重复确认不产生重复
+        行，随后从存储水位起按稀疏确认连续重算水位。
+        """
+        consumer = conn.execute(
+            "SELECT id, watermark FROM device_consumers "
+            "WHERE device_id = ? AND consumer_id = ?",
+            (device_id, consumer_id),
+        ).fetchone()
+        if consumer is None:
+            raise LeaseConflict(
+                reason="consumer_not_registered",
+                message=(
+                    f"consumer {consumer_id!r} is not registered as a required "
+                    f"consumer of device {device_id!r}"
+                ),
+                device_id=device_id,
+                consumer_id=consumer_id,
+            )
+        conn.executemany(
+            "INSERT OR IGNORE INTO device_batch_acks "
+            "(device_id, consumer_id, sequence, batch_digest, confirmed_at) "
+            "SELECT ?, ?, ?, b.digest, ? FROM device_batches b "
+            "WHERE b.device_id = ? AND b.sequence = ?",
+            [(device_id, consumer_id, seq, now, device_id, seq) for seq in sequences],
+        )
+        watermark = consumer["watermark"]
+        while True:
+            nxt = conn.execute(
+                "SELECT 1 FROM device_batch_acks "
+                "WHERE device_id = ? AND consumer_id = ? AND sequence = ?",
+                (device_id, consumer_id, watermark + 1),
+            ).fetchone()
+            if nxt is None:
+                break
+            watermark += 1
+        if watermark != consumer["watermark"]:
+            conn.execute(
+                "UPDATE device_consumers SET watermark = ? WHERE id = ?",
+                (watermark, consumer["id"]),
+            )
+        return watermark
+
+    @staticmethod
+    def _active_lease_overlap(
+        conn, device_id: str, first_sequence: int, last_sequence: int
+    ) -> list[dict]:
+        """返回与闭区间 ``first_sequence..last_sequence`` 重叠的全部未终结
+        （active，含已过期但未回收）租约的占用信息。
+
+        归档用它保证「不得清除仍被租约占用的明细」：只要有 active 租约
+        覆盖区间内任一批次，归档即被挡住。
+        """
+        rows = conn.execute(
+            "SELECT l.id AS lease_id, l.consumer_id AS consumer_id, "
+            "l.from_sequence AS from_sequence, l.to_sequence AS to_sequence, "
+            "l.expires_at AS expires_at, l.idempotency_key AS idempotency_key "
+            "FROM batch_leases l "
+            "JOIN batch_lease_batches lb ON lb.lease_id = l.id "
+            "WHERE l.device_id = ? AND l.status = 'active' "
+            "AND lb.sequence BETWEEN ? AND ? "
+            "GROUP BY l.id ORDER BY l.id",
+            (device_id, first_sequence, last_sequence),
+        ).fetchall()
+        now = time.time()
+        return [
+            {
+                "lease_id": r["lease_id"],
+                "consumer_id": r["consumer_id"],
+                "from_sequence": r["from_sequence"],
+                "to_sequence": r["to_sequence"],
+                "expires_at": _iso(r["expires_at"]),
+                "expired": now >= r["expires_at"],
+                "idempotency_key": r["idempotency_key"],
+            }
+            for r in rows
+        ]
+
+    def claim_lease(
+        self,
+        device_id: str,
+        consumer_id: str,
+        max_batches: int,
+        lease_seconds: int,
+        idempotency_key: str,
+    ) -> tuple[dict, bool]:
+        """为已登记消费者领取批次处理租约（单事务，幂等）。
+
+        在单个 BEGIN IMMEDIATE 事务内：
+
+        1. 消费者必须已登记（否则 409 ``consumer_not_registered``）；
+        2. 该消费者已有 ``active`` 租约时：同幂等键重试返回原租约
+           （``created=False``，HTTP 200；租约已过期也原样返回，由客户端
+           显式回收）；不同键返回 409——租约未过期时 ``reason=lease_active``，
+           已过期时 ``reason=lease_expired``；
+        3. 幂等键已被其他租约（任何设备/消费者，含已终结租约）占用返回 409
+           ``idempotency_key_in_use``；
+        4. 从该消费者连续水位的下一批（归档后登记的消费者从
+           ``archived_through`` 起步）起，选择至多 ``max_batches`` 个
+           **未归档连续**批次——遇到缺批次、墓碑或链头即停；
+        5. 保存租约与每批摘要（``batch_lease_batches``），返回各批观测明细
+           与租约到期时间。没有可领取批次时不创建租约，返回
+           ``status=no_batches_available``（HTTP 200）。
+
+        部分唯一索引保证每个 (设备, 消费者) 至多一个 active 租约，写锁
+        串行化保证同一区间绝不会分给两个租约。
+        """
+        now = time.time()
+        with self._write_tx() as conn:
+            consumer = conn.execute(
+                "SELECT watermark FROM device_consumers "
+                "WHERE device_id = ? AND consumer_id = ?",
+                (device_id, consumer_id),
+            ).fetchone()
+            if consumer is None:
+                raise LeaseConflict(
+                    reason="consumer_not_registered",
+                    message=(
+                        f"consumer {consumer_id!r} is not registered as a required "
+                        f"consumer of device {device_id!r}; register it before "
+                        "claiming a batch lease"
+                    ),
+                    device_id=device_id,
+                    consumer_id=consumer_id,
+                )
+
+            active = conn.execute(
+                "SELECT id FROM batch_leases "
+                "WHERE device_id = ? AND consumer_id = ? AND status = 'active'",
+                (device_id, consumer_id),
+            ).fetchone()
+            if active is not None:
+                lease = self._get_lease(conn, int(active["id"]))
+                if lease["idempotency_key"] == idempotency_key:
+                    # 同键重试：返回原租约（无论是否已过期），不续期不重领
+                    return lease, False
+                raise LeaseConflict(
+                    message=(
+                        f"consumer {consumer_id!r} already has an active lease "
+                        f"{lease['lease_id']} on device {device_id!r} "
+                        f"(range {lease['from_sequence']}..{lease['to_sequence']}, "
+                        f"expired={lease['expired']}); complete it, or recycle it "
+                        "first if expired"
+                    ),
+                    reason="lease_expired" if lease["expired"] else "lease_active",
+                    device_id=device_id,
+                    consumer_id=consumer_id,
+                    active_lease_id=lease["lease_id"],
+                    active_lease_status="expired" if lease["expired"] else "active",
+                    active_from_sequence=lease["from_sequence"],
+                    active_to_sequence=lease["to_sequence"],
+                    active_expires_at=lease["expires_at"],
+                )
+
+            key_row = conn.execute(
+                "SELECT id, device_id, consumer_id FROM batch_leases "
+                "WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if key_row is not None:
+                raise LeaseConflict(
+                    message=(
+                        f"idempotency_key {idempotency_key!r} is already used by "
+                        f"lease {key_row['id']} (device {key_row['device_id']!r}, "
+                        f"consumer {key_row['consumer_id']!r})"
+                    ),
+                    reason="idempotency_key_in_use",
+                    idempotency_key=idempotency_key,
+                    occupied_by_lease_id=int(key_row["id"]),
+                    occupied_device_id=key_row["device_id"],
+                    occupied_consumer_id=key_row["consumer_id"],
+                )
+
+            chain = conn.execute(
+                "SELECT last_sequence, archived_through FROM device_chains "
+                "WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()
+            head_sequence = chain["last_sequence"] if chain is not None else 0
+            archived_through = chain["archived_through"] if chain is not None else 0
+            start = max(consumer["watermark"], archived_through) + 1
+
+            # 从未归档的连续区间选择：遇到缺批次、墓碑或链头即停
+            rows = conn.execute(
+                "SELECT sequence, batch_id, previous_digest, digest, "
+                "observation_count, thresholds, observations, archived_at "
+                "FROM device_batches "
+                "WHERE device_id = ? AND sequence >= ? "
+                "ORDER BY sequence LIMIT ?",
+                (device_id, start, max_batches + 1),
+            ).fetchall()
+            chosen = []
+            expected = start
+            for r in rows:
+                if r["sequence"] != expected or r["archived_at"] is not None:
+                    break
+                chosen.append(r)
+                expected += 1
+                if len(chosen) >= max_batches:
+                    break
+
+            fields = self._archive_status_fields(conn, device_id)
+            if not chosen:
+                # 没有可领取的连续未归档批次：不创建租约、不占用幂等键
+                return {
+                    "status": "no_batches_available",
+                    "device_id": device_id,
+                    "consumer_id": consumer_id,
+                    "idempotency_key": idempotency_key,
+                    "lease_id": None,
+                    "lease_status": None,
+                    "from_sequence": None,
+                    "to_sequence": None,
+                    "batch_count": 0,
+                    "expires_at": None,
+                    "expired": False,
+                    "watermark": consumer["watermark"],
+                    "next_sequence": start,
+                    "head_sequence": head_sequence,
+                    "archived_through": archived_through,
+                    "safe_sequence": fields["safe_sequence"],
+                    "batches": [],
+                }, True
+
+            from_sequence = chosen[0]["sequence"]
+            to_sequence = chosen[-1]["sequence"]
+            expires_at = now + lease_seconds
+            cur = conn.execute(
+                "INSERT INTO batch_leases "
+                "(idempotency_key, device_id, consumer_id, from_sequence, "
+                "to_sequence, lease_seconds, status, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+                (
+                    idempotency_key,
+                    device_id,
+                    consumer_id,
+                    from_sequence,
+                    to_sequence,
+                    lease_seconds,
+                    now,
+                    expires_at,
+                ),
+            )
+            lease_id = int(cur.lastrowid)
+            conn.executemany(
+                "INSERT INTO batch_lease_batches "
+                "(lease_id, sequence, batch_id, previous_digest, digest, "
+                "observation_count) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        lease_id,
+                        r["sequence"],
+                        r["batch_id"],
+                        r["previous_digest"],
+                        r["digest"],
+                        r["observation_count"],
+                    )
+                    for r in chosen
+                ],
+            )
+            lease = self._get_lease(conn, lease_id)
+        return lease, True
+
+    @staticmethod
+    def _lease_batch_summaries(conn, lease_id: int) -> list[dict]:
+        rows = conn.execute(
+            "SELECT lb.sequence AS sequence, lb.batch_id AS batch_id, "
+            "lb.previous_digest AS previous_digest, lb.digest AS digest, "
+            "lb.observation_count AS saved_observation_count, "
+            "b.observations AS observations, b.thresholds AS thresholds, "
+            "b.archived_at AS archived_at, b.digest AS current_digest "
+            "FROM batch_lease_batches lb "
+            "LEFT JOIN device_batches b "
+            "ON b.device_id = (SELECT device_id FROM batch_leases WHERE id = lb.lease_id) "
+            "AND b.sequence = lb.sequence "
+            "WHERE lb.lease_id = ? ORDER BY lb.sequence",
+            (lease_id,),
+        ).fetchall()
+        items = []
+        for r in rows:
+            if r["observations"] is None or r["archived_at"] is not None:
+                # 已终结租约或批次已归档：明细可能已不在，只返回保存的摘要
+                observations = None
+                thresholds = None
+            else:
+                observations = json.loads(r["observations"])
+                thresholds = json.loads(r["thresholds"])
+            items.append(
+                {
+                    "sequence": r["sequence"],
+                    "batch_id": r["batch_id"],
+                    "previous_digest": r["previous_digest"],
+                    "digest": r["digest"],
+                    "current_digest": r["current_digest"],
+                    "observation_count": r["saved_observation_count"],
+                    "observations": observations,
+                    "thresholds": thresholds,
+                }
+            )
+        return items
+
+    def _get_lease(self, conn, lease_id: int) -> dict:
+        """在给定连接内组装租约详情（含每批摘要；active 租约附观测明细）。"""
+        r = conn.execute(
+            "SELECT * FROM batch_leases WHERE id = ?", (lease_id,)
+        ).fetchone()
+        if r is None:
+            return None
+        now = time.time()
+        expired = now >= r["expires_at"]
+        summaries = self._lease_batch_summaries(conn, lease_id)
+        consumer = conn.execute(
+            "SELECT watermark FROM device_consumers "
+            "WHERE device_id = ? AND consumer_id = ?",
+            (r["device_id"], r["consumer_id"]),
+        ).fetchone()
+        chain = conn.execute(
+            "SELECT last_sequence, archived_through FROM device_chains "
+            "WHERE device_id = ?",
+            (r["device_id"],),
+        ).fetchone()
+        head_sequence = chain["last_sequence"] if chain is not None else 0
+        archived_through = chain["archived_through"] if chain is not None else 0
+
+        def batch_view(item: dict) -> dict:
+            view = {
+                "sequence": item["sequence"],
+                "batch_id": item["batch_id"],
+                "previous_digest": item["previous_digest"],
+                "digest": item["digest"],
+                "observation_count": item["observation_count"],
+            }
+            # active 且未终结的租约返回领取时承诺的观测明细，处理进程无需
+            # 再自行挑批次读链；明细已被归档（只可能发生在已终结租约）时为 null
+            if item["observations"] is not None and r["status"] == "active":
+                view["observations"] = item["observations"]
+                view["thresholds"] = item["thresholds"]
+            else:
+                view["observations"] = None
+                view["thresholds"] = None
+            return view
+
+        body = {
+            "status": "leased",
+            "device_id": r["device_id"],
+            "consumer_id": r["consumer_id"],
+            "lease_id": r["id"],
+            "idempotency_key": r["idempotency_key"],
+            "lease_status": r["status"],
+            "from_sequence": r["from_sequence"],
+            "to_sequence": r["to_sequence"],
+            "batch_count": len(summaries),
+            "lease_seconds": r["lease_seconds"],
+            "created_at": _iso(r["created_at"]),
+            "expires_at": _iso(r["expires_at"]),
+            "expired": expired,
+            "completed_at": _iso(r["completed_at"]),
+            "recycled_at": _iso(r["recycled_at"]),
+            "watermark": consumer["watermark"] if consumer is not None else None,
+            "head_sequence": head_sequence,
+            "archived_through": archived_through,
+            "batches": [batch_view(item) for item in summaries],
+        }
+        if r["status"] == "completed":
+            body["status"] = "completed"
+        elif r["status"] == "recycled":
+            body["status"] = "recycled"
+        return body
+
+    def complete_lease(
+        self, device_id: str, lease_id: int, consumer_id: str, items: list[dict]
+    ) -> tuple[dict, bool]:
+        """完成租约：逐项核对摘要，在同一事务写确认、推进水位并释放租约。
+
+        任一条件不满足即整体拒绝（:class:`LeaseConflict`，409），不写入任何
+        确认、不推进水位、租约保持 active：
+
+        - 租约不属于该设备 → 404；消费者不匹配 → 409 ``lease_consumer_mismatch``；
+        - 租约已完成 → 幂等返回原结果（HTTP 200，``status=already_completed``）；
+        - 租约已回收 → 409 ``lease_recycled``；租约已过期 → 409 ``lease_expired``
+          （不会静默推进，须显式回收后重新领取）；
+        - 提交序号集合与租约区间不一致：缺批次
+          ``missing_sequences`` / 多批次 ``unexpected_sequences``；
+        - 租约批次在库中缺失（不应发生）→ ``batch_missing``；
+        - 任一摘要与服务端当前摘要不符 → ``digest_mismatch``，附期望摘要。
+
+        核对全部通过后，在同一事务写入稀疏确认、把连续水位推进至首个缺口、
+        租约置 ``completed`` 并释放（active 索引随之放行下一租约）。
+        """
+        now = time.time()
+        with self._write_tx() as conn:
+            lease = conn.execute(
+                "SELECT * FROM batch_leases WHERE id = ?", (lease_id,)
+            ).fetchone()
+            if lease is None or lease["device_id"] != device_id:
+                raise LeaseNotFound(f"lease {lease_id} of device {device_id!r} not found")
+            if lease["consumer_id"] != consumer_id:
+                raise LeaseConflict(
+                    reason="lease_consumer_mismatch",
+                    message=(
+                        f"lease {lease_id} belongs to consumer "
+                        f"{lease['consumer_id']!r}, not {consumer_id!r}"
+                    ),
+                    lease_id=lease_id,
+                    device_id=device_id,
+                    consumer_id=consumer_id,
+                    expected_consumer_id=lease["consumer_id"],
+                )
+            if lease["status"] == "completed":
+                return self._get_lease(conn, lease_id), False
+            if lease["status"] == "recycled":
+                raise LeaseConflict(
+                    reason="lease_recycled",
+                    message=(
+                        f"lease {lease_id} has been recycled and cannot be completed; "
+                        "claim a new lease for the remaining batches"
+                    ),
+                    lease_id=lease_id,
+                    device_id=device_id,
+                    consumer_id=consumer_id,
+                )
+            if now >= lease["expires_at"]:
+                raise LeaseConflict(
+                    reason="lease_expired",
+                    message=(
+                        f"lease {lease_id} expired at {_iso(lease['expires_at'])}; "
+                        "completion is refused so the batches can be re-leased after "
+                        "an explicit recycle"
+                    ),
+                    lease_id=lease_id,
+                    device_id=device_id,
+                    consumer_id=consumer_id,
+                    expires_at=_iso(lease["expires_at"]),
+                )
+
+            saved = {
+                r["sequence"]: r
+                for r in conn.execute(
+                    "SELECT sequence, digest FROM batch_lease_batches WHERE lease_id = ?",
+                    (lease_id,),
+                ).fetchall()
+            }
+            provided = {item["sequence"]: item["batch_digest"] for item in items}
+            expected_set = set(range(lease["from_sequence"], lease["to_sequence"] + 1))
+            missing = sorted(expected_set - provided.keys())
+            unexpected = sorted(provided.keys() - expected_set)
+            if missing or unexpected:
+                raise LeaseConflict(
+                    message=(
+                        f"lease {lease_id} covers sequences "
+                        f"{lease['from_sequence']}..{lease['to_sequence']}; completion "
+                        "items must cover exactly that set"
+                    ),
+                    reason="items_do_not_match_lease",
+                    lease_id=lease_id,
+                    device_id=device_id,
+                    consumer_id=consumer_id,
+                    from_sequence=lease["from_sequence"],
+                    to_sequence=lease["to_sequence"],
+                    missing_sequences=missing,
+                    unexpected_sequences=unexpected,
+                )
+
+            # 逐项核对：租约保存摘要与服务端当前批次摘要均须一致
+            current = {
+                r["sequence"]: r
+                for r in conn.execute(
+                    "SELECT sequence, digest, archived_at FROM device_batches "
+                    "WHERE device_id = ? AND sequence BETWEEN ? AND ?",
+                    (device_id, lease["from_sequence"], lease["to_sequence"]),
+                ).fetchall()
+            }
+            for seq in sorted(provided):
+                if seq not in saved:  # 理论上被上面的集合校验挡住，防御性兜底
+                    raise LeaseConflict(
+                        reason="batch_missing",
+                        message=f"sequence {seq} is not part of lease {lease_id}",
+                        lease_id=lease_id,
+                        sequence=seq,
+                    )
+                cur = current.get(seq)
+                if cur is None:
+                    raise LeaseConflict(
+                        reason="batch_missing",
+                        message=f"batch {seq} of device {device_id!r} no longer exists",
+                        lease_id=lease_id,
+                        sequence=seq,
+                    )
+                if provided[seq] != cur["digest"]:
+                    raise LeaseConflict(
+                        reason="digest_mismatch",
+                        message=(
+                            f"batch_digest for sequence {seq} does not match the "
+                            "current digest; completion is refused"
+                        ),
+                        lease_id=lease_id,
+                        device_id=device_id,
+                        consumer_id=consumer_id,
+                        sequence=seq,
+                        provided_digest=provided[seq],
+                        expected_digest=cur["digest"],
+                    )
+                if provided[seq] != saved[seq]["digest"]:
+                    # 批次当前摘要与领取时保存的摘要不一致（批次不可变，
+                    # 正常不会发生；显式核对以保证完成的是领取时观测的内容）
+                    raise LeaseConflict(
+                        reason="digest_changed",
+                        message=(
+                            f"digest for sequence {seq} changed since the lease was "
+                            "granted; completion is refused"
+                        ),
+                        lease_id=lease_id,
+                        device_id=device_id,
+                        consumer_id=consumer_id,
+                        sequence=seq,
+                        leased_digest=saved[seq]["digest"],
+                        expected_digest=cur["digest"],
+                    )
+
+            watermark = self._save_acks_and_advance(
+                conn, device_id, consumer_id, sorted(provided), now
+            )
+            conn.execute(
+                "UPDATE batch_leases SET status = 'completed', completed_at = ? "
+                "WHERE id = ?",
+                (now, lease_id),
+            )
+            body = self._get_lease(conn, lease_id)
+            fields = self._archive_status_fields(conn, device_id)
+            body["watermark"] = watermark
+            body["safe_sequence"] = fields["safe_sequence"]
+            body["first_gap"] = fields["safe_sequence"] + 1
+            body["blocking_consumers"] = fields["blocking_consumers"]
+        return body, True
+
+    def recycle_lease(
+        self, device_id: str, lease_id: int, consumer_id: str
+    ) -> tuple[dict, bool]:
+        """显式回收租约，使其区间可以被重新领取（单事务）。
+
+        - 租约不属于该设备 → 404；消费者不匹配 → 409 ``lease_consumer_mismatch``；
+        - 已回收 → 幂等返回（HTTP 200，``status=already_recycled``）；
+        - 已完成 → 409 ``lease_not_active``（完成即终结，无需回收）；
+        - active 但尚未过期 → 409 ``lease_not_expired``（只允许回收过期租约；
+          放弃未到期租约不属于正常处理流程，须先完成或等待到期）；
+        - active 且已过期 → 置 ``recycled``（HTTP 200，``status=recycled``），
+          部分唯一索引放行该消费者的下一次领取。
+        """
+        now = time.time()
+        with self._write_tx() as conn:
+            lease = conn.execute(
+                "SELECT * FROM batch_leases WHERE id = ?", (lease_id,)
+            ).fetchone()
+            if lease is None or lease["device_id"] != device_id:
+                raise LeaseNotFound(f"lease {lease_id} of device {device_id!r} not found")
+            if lease["consumer_id"] != consumer_id:
+                raise LeaseConflict(
+                    reason="lease_consumer_mismatch",
+                    message=(
+                        f"lease {lease_id} belongs to consumer "
+                        f"{lease['consumer_id']!r}, not {consumer_id!r}"
+                    ),
+                    lease_id=lease_id,
+                    device_id=device_id,
+                    consumer_id=consumer_id,
+                    expected_consumer_id=lease["consumer_id"],
+                )
+            if lease["status"] == "recycled":
+                return self._get_lease(conn, lease_id), False
+            if lease["status"] == "completed":
+                raise LeaseConflict(
+                    reason="lease_not_active",
+                    message=f"lease {lease_id} is already completed and cannot be recycled",
+                    lease_id=lease_id,
+                    device_id=device_id,
+                    consumer_id=consumer_id,
+                )
+            if now < lease["expires_at"]:
+                raise LeaseConflict(
+                    reason="lease_not_expired",
+                    message=(
+                        f"lease {lease_id} is still active until "
+                        f"{_iso(lease['expires_at'])}; only expired leases can be "
+                        "recycled (complete it or wait for expiry)"
+                    ),
+                    lease_id=lease_id,
+                    device_id=device_id,
+                    consumer_id=consumer_id,
+                    expires_at=_iso(lease["expires_at"]),
+                )
+            conn.execute(
+                "UPDATE batch_leases SET status = 'recycled', recycled_at = ? "
+                "WHERE id = ?",
+                (now, lease_id),
+            )
+            body = self._get_lease(conn, lease_id)
+        return body, True
+
+    def get_lease(self, device_id: str, lease_id: int) -> dict | None:
+        """查询单个租约详情（含每批摘要；active 租约附观测明细）。"""
+        with closing(self._connect()) as conn:
+            body = self._get_lease(conn, lease_id)
+        if body is None or body["device_id"] != device_id:
+            return None
+        return body
+
+    def list_leases(
+        self, device_id: str, *, consumer_id: str | None = None, active_only: bool = False
+    ) -> dict:
+        """列出设备的处理租约（按 id 升序），可按消费者过滤、只看未终结租约。"""
+        with closing(self._connect()) as conn:
+            sql = "SELECT id FROM batch_leases WHERE device_id = ?"
+            params: list = [device_id]
+            if consumer_id is not None:
+                sql += " AND consumer_id = ?"
+                params.append(consumer_id)
+            if active_only:
+                sql += " AND status = 'active'"
+            sql += " ORDER BY id"
+            rows = conn.execute(sql, params).fetchall()
+            leases = [self._get_lease(conn, int(r["id"])) for r in rows]
+        return {
+            "device_id": device_id,
+            "consumer_id": consumer_id,
+            "active_only": active_only,
+            "count": len(leases),
+            "leases": leases,
         }
 
     # ---------------- 草稿回放报告 ----------------
@@ -2589,6 +3314,125 @@ class Database:
             "SELECT COUNT(*) AS c FROM batch_judgments WHERE device_id = ?",
             (device_id,),
         ).fetchone()["c"]
+
+        # ---- 批次处理租约：区间/摘要与当前批次一致，active 租约与墓碑边界一致 ----
+        lease_rows = conn.execute(
+            "SELECT l.id AS lease_id, l.status AS status, "
+            "l.from_sequence AS from_sequence, l.to_sequence AS to_sequence, "
+            "l.consumer_id AS consumer_id, lb.sequence AS sequence, "
+            "lb.digest AS leased_digest, lb.batch_id AS leased_batch_id, "
+            "lb.observation_count AS leased_count, "
+            "b.digest AS cur_digest, b.batch_id AS cur_batch_id, "
+            "b.observation_count AS cur_count, b.archived_at AS cur_archived_at "
+            "FROM batch_leases l "
+            "JOIN batch_lease_batches lb ON lb.lease_id = l.id "
+            "LEFT JOIN device_batches b "
+            "ON b.device_id = l.device_id AND b.sequence = lb.sequence "
+            "WHERE l.device_id = ? ORDER BY l.id, lb.sequence",
+            (device_id,),
+        ).fetchall()
+        checked_leases = len(lease_rows)
+        lease_meta = {
+            r["id"]: r
+            for r in conn.execute(
+                "SELECT id, status, consumer_id, from_sequence, to_sequence "
+                "FROM batch_leases WHERE device_id = ?",
+                (device_id,),
+            ).fetchall()
+        }
+        seen_ranges: dict[int, set[int]] = {}
+        active_ranges: list[tuple[int, int, int]] = []
+        for lr in lease_rows:
+            lid = lr["lease_id"]
+            meta = lease_meta[lid]
+            ctx = {"lease_id": lid, "consumer_id": lr["consumer_id"]}
+            seen_ranges.setdefault(lid, set()).add(lr["sequence"])
+            if lr["cur_digest"] is None:
+                issues.append(
+                    _issue(
+                        "lease_batch_missing",
+                        lr["sequence"],
+                        "present",
+                        "missing",
+                        **ctx,
+                    )
+                )
+                continue
+            if lr["leased_digest"] != lr["cur_digest"]:
+                issues.append(
+                    _issue(
+                        "lease_digest_mismatch",
+                        lr["sequence"],
+                        lr["cur_digest"],
+                        lr["leased_digest"],
+                        **ctx,
+                    )
+                )
+            if lr["leased_batch_id"] != lr["cur_batch_id"]:
+                issues.append(
+                    _issue(
+                        "lease_batch_id_mismatch",
+                        lr["sequence"],
+                        lr["cur_batch_id"],
+                        lr["leased_batch_id"],
+                        **ctx,
+                    )
+                )
+            if lr["leased_count"] != lr["cur_count"]:
+                issues.append(
+                    _issue(
+                        "lease_observation_count_mismatch",
+                        lr["sequence"],
+                        lr["cur_count"],
+                        lr["leased_count"],
+                        **ctx,
+                    )
+                )
+            # active 租约占用的批次不得已是归档墓碑（归档守卫的不变量）
+            if meta["status"] == "active" and lr["cur_archived_at"] is not None:
+                issues.append(
+                    _issue(
+                        "active_lease_batch_archived",
+                        lr["sequence"],
+                        "present",
+                        "archived",
+                        **ctx,
+                    )
+                )
+        for lid, meta in lease_meta.items():
+            ctx = {"lease_id": lid, "consumer_id": meta["consumer_id"]}
+            expected_range = set(
+                range(meta["from_sequence"], meta["to_sequence"] + 1)
+            )
+            if seen_ranges.get(lid, set()) != expected_range:
+                issues.append(
+                    _issue(
+                        "lease_range_incomplete",
+                        None,
+                        sorted(expected_range),
+                        sorted(seen_ranges.get(lid, set())),
+                        **ctx,
+                    )
+                )
+            if meta["status"] == "active":
+                active_ranges.append(
+                    (lid, meta["from_sequence"], meta["to_sequence"])
+                )
+        # active 租约区间互不重叠（同一区间不得分给两个租约；不同消费者也不行）
+        for i, (id_a, fa, ta) in enumerate(active_ranges):
+            for id_b, fb, tb in active_ranges[i + 1:]:
+                if fa <= tb and fb <= ta:
+                    issues.append(
+                        _issue(
+                            "active_lease_overlap",
+                            None,
+                            f"lease {id_a} disjoint",
+                            f"leases {id_a} & {id_b} overlap",
+                            lease_id=id_a,
+                            overlapping_lease_id=id_b,
+                        )
+                    )
+
         # 快照上限：核验时刻从批次表推导的链上界（游标值若不一致已在问题清单中）
         snapshot = {
             "head_sequence": head_sequence,
@@ -2598,6 +3442,7 @@ class Database:
             "safe_sequence": min((c["watermark"] for c in consumers), default=0),
             "consumer_count": len(consumers),
             "batch_judgment_count": judgment_count,
+            "active_lease_count": len(active_ranges),
         }
         return {
             "device_id": device_id,
@@ -2611,5 +3456,6 @@ class Database:
             "archived_batches": archived_batches,
             "checked_acknowledgments": len(ack_rows),
             "checked_judgment_sources": len(source_rows),
+            "checked_lease_batches": checked_leases,
             "snapshot": snapshot,
         }

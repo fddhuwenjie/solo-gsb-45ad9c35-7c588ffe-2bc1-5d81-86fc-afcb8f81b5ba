@@ -13,6 +13,8 @@ from .db import (
     ChainVerificationNotFound,
     ConsumerConflict,
     Database,
+    LeaseConflict,
+    LeaseNotFound,
     ReplayConflict,
     VersionConflict,
     VersionNotFound,
@@ -26,6 +28,9 @@ from .models import (
     ChainVerifyRequest,
     ConsumerRegisterRequest,
     JudgeRequest,
+    LeaseClaimRequest,
+    LeaseCompleteRequest,
+    LeaseRecycleRequest,
     LibraryImportRequest,
     PatrolAnalyzeRequest,
     ReplayReportRequest,
@@ -108,10 +113,17 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "设备链一致性核验在单个只读 SQLite 事务内固定快照：逐批重算范围内"
             "未归档批次的规范 SHA-256，核对 previous_digest 链、序号连续性、"
             "batch_count/last_sequence/head_digest、archived_through 墓碑边界、"
-            "消费者确认摘要与水位及连续批次判定来源摘要，返回快照上限、ok 与"
-            "问题清单（issue_code/sequence/expected/actual），发现问题不改数据。"
+            "消费者确认摘要与水位、连续批次判定来源摘要与处理租约占用，返回"
+            "快照上限、ok 与问题清单（issue_code/sequence/expected/actual），"
+            "发现问题不改数据。"
+            "已登记消费者可领取批次处理租约：从其连续水位的下一批起在单个写"
+            "事务内租出至多 20 个未归档连续批次并保存每批摘要；同消费者未终结"
+            "租约下同键重试返回原租约、其他键 409，区间绝不重复分配。完成租约"
+            "在同一事务逐项核对摘要、写确认、推进水位并释放；摘要变化/缺批次/"
+            "过期整体拒绝。归档不得清除仍被租约占用的明细，过期租约可显式回收"
+            "后重新领取。"
         ),
-        version="1.9.0",
+        version="1.10.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -627,6 +639,131 @@ def create_app(db_path: str | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=exc.detail)
         if not created:
             response.status_code = 200
+        return body
+
+    # ---------------- 已登记消费者批次处理租约 ----------------
+
+    @app.post(
+        "/field-devices/{device_id}/leases",
+        status_code=201,
+        summary="领取批次处理租约（从消费者连续水位的下一批起租未归档连续区间）",
+        description=(
+            "请求提交 consumer_id、max_batches（≤20）、lease_seconds（1~3600）"
+            "与 idempotency_key。服务在单个 SQLite 写事务内从该消费者连续水位"
+            "的下一批（归档后登记的消费者从 archived_through 起步）开始选择至多 "
+            "max_batches 个未归档的连续批次，保存租约及每批摘要并返回各批观测"
+            "明细。同一消费者存在未终结租约时：相同幂等键重试返回原租约"
+            "（HTTP 200，租约已过期也原样返回），其他键返回 409（未过期 "
+            "lease_active / 已过期 lease_expired）；幂等键被其他租约占用返回 "
+            "409。没有可领取批次时不创建租约，返回 status=no_batches_available。"
+        ),
+    )
+    def claim_device_lease(
+        req: LeaseClaimRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        try:
+            body, created = app.state.db.claim_lease(
+                device_id,
+                req.consumer_id,
+                req.max_batches,
+                req.lease_seconds,
+                req.idempotency_key,
+            )
+        except LeaseConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        if not created:
+            response.status_code = 200
+        return body
+
+    @app.post(
+        "/field-devices/{device_id}/leases/{lease_id}/complete",
+        status_code=201,
+        summary="完成租约：逐项核对摘要，同事务写确认、推进水位并释放租约",
+        description=(
+            "提交 consumer_id 与租约内全部批次的 (sequence, batch_digest)。"
+            "服务在单个 SQLite 写事务内逐项核对当前摘要：摘要变化、缺批次、"
+            "多批次或租约已过期时整体 409 拒绝，不写入确认、不推进水位、不"
+            "释放租约；核对全部通过则写入稀疏确认、把连续水位推进至首个缺口、"
+            "租约置 completed 并释放。重复完成已完成租约幂等（HTTP 200，"
+            "保留首次 completed_at）。"
+        ),
+    )
+    def complete_device_lease(
+        req: LeaseCompleteRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+        lease_id: int = Path(ge=1),
+    ) -> dict:
+        items = [
+            {"sequence": item.sequence, "batch_digest": item.batch_digest}
+            for item in req.items
+        ]
+        try:
+            body, created = app.state.db.complete_lease(
+                device_id, lease_id, req.consumer_id, items
+            )
+        except LeaseNotFound:
+            raise HTTPException(status_code=404, detail="lease not found")
+        except LeaseConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        if not created:
+            response.status_code = 200
+        return body
+
+    @app.post(
+        "/field-devices/{device_id}/leases/{lease_id}/recycle",
+        status_code=200,
+        summary="显式回收已过期租约，使其区间可以被重新领取",
+        description=(
+            "仅可回收已过期的 active 租约：置 recycled 后该消费者才能领取下"
+            "一个租约。未过期返回 409（lease_not_expired）；已完成返回 409"
+            "（lease_not_active）；重复回收幂等（status=already_recycled）。"
+        ),
+    )
+    def recycle_device_lease(
+        req: LeaseRecycleRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+        lease_id: int = Path(ge=1),
+    ) -> dict:
+        try:
+            body, recycled = app.state.db.recycle_lease(
+                device_id, lease_id, req.consumer_id
+            )
+        except LeaseNotFound:
+            raise HTTPException(status_code=404, detail="lease not found")
+        except LeaseConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        if not recycled:
+            response.status_code = 200
+        return body
+
+    @app.get(
+        "/field-devices/{device_id}/leases",
+        summary="查询设备的批次处理租约（可按消费者过滤、只看未终结租约）",
+    )
+    def list_device_leases(
+        device_id: str = Path(min_length=1, max_length=128),
+        consumer_id: str | None = Query(None, min_length=1, max_length=128),
+        active_only: bool = Query(False, description="只返回未终结（active）租约"),
+    ) -> dict:
+        return app.state.db.list_leases(
+            device_id, consumer_id=consumer_id, active_only=active_only
+        )
+
+    @app.get(
+        "/field-devices/{device_id}/leases/{lease_id}",
+        summary="查询单个租约详情（每批摘要；未终结租约附观测明细）",
+    )
+    def get_device_lease(
+        device_id: str = Path(min_length=1, max_length=128),
+        lease_id: int = Path(ge=1),
+    ) -> dict:
+        body = app.state.db.get_lease(device_id, lease_id)
+        if body is None:
+            raise HTTPException(status_code=404, detail="lease not found")
         return body
 
     # ---------------- 连续批次归档前巡检判定 ----------------

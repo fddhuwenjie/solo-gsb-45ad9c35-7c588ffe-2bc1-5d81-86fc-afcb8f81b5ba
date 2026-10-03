@@ -279,6 +279,82 @@ class BatchJudgmentRequest(BaseModel):
         return self
 
 
+class LeaseClaimRequest(BaseModel):
+    """为已登记消费者领取一个批次处理租约。
+
+    服务在单个 SQLite 写事务内从该消费者**连续水位的下一批**开始，选择至多
+    ``max_batches`` 个未归档的连续批次，保存租约与每批摘要并返回各批观测
+    明细。``lease_seconds`` 为租约有效期（1～3600 秒）。同一消费者存在未过期
+    租约时：相同 ``idempotency_key`` 重试返回原租约（HTTP 200），其他键返回
+    409——同一区间绝不会分给两个租约。
+    """
+
+    consumer_id: str = Field(min_length=1, max_length=128, description="已登记的必需消费者编号")
+    max_batches: int = Field(
+        ge=1, le=20, description="本次最多领取的批次数（1～20）"
+    )
+    lease_seconds: int = Field(
+        ge=1, le=3600, description="租约有效期（秒，1～3600）"
+    )
+    idempotency_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="客户端生成的幂等键（全局唯一；网络重试复用同一键）",
+    )
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _key_non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("idempotency_key must not be blank")
+        return v
+
+
+class LeaseCompleteItem(BaseModel):
+    """完成租约时逐项核对的单批结果：序号与领取时返回的批次摘要。"""
+
+    sequence: int = Field(ge=1, description="租约内批次序号")
+    batch_digest: str = Field(description="领取时该批的 SHA-256 摘要（64 位十六进制）")
+
+    @field_validator("batch_digest")
+    @classmethod
+    def _normalize_batch_digest(cls, v: str) -> str:
+        s = (v or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", s):
+            raise ValueError("batch_digest must be a 64-char lowercase hex sha256")
+        return s
+
+
+class LeaseCompleteRequest(BaseModel):
+    """完成租约：逐项核对摘要，在同一事务写入确认、推进水位并释放租约。
+
+    必须覆盖租约内**全部**批次且每项摘要与服务端当前摘要一致；摘要变化、
+    缺批次、多批次或租约已过期时整体拒绝（409），不写入任何确认、不推进
+    水位、不释放租约。
+    """
+
+    consumer_id: str = Field(min_length=1, max_length=128, description="领取租约的消费者编号")
+    items: list[LeaseCompleteItem] = Field(
+        min_length=1, max_length=20, description="租约内全部批次的逐项核对结果"
+    )
+
+    @field_validator("items")
+    @classmethod
+    def _unique_sequences(cls, v: list["LeaseCompleteItem"]) -> list["LeaseCompleteItem"]:
+        seqs = [item.sequence for item in v]
+        if len(seqs) != len(set(seqs)):
+            raise ValueError("duplicate sequence in lease completion items")
+        return v
+
+
+class LeaseRecycleRequest(BaseModel):
+    """显式回收一个已过期（或已完成）的租约，使其区间可以被重新领取。"""
+
+    consumer_id: str = Field(
+        min_length=1, max_length=128, description="领取租约的消费者编号（须与租约一致）"
+    )
+
+
 class ArchiveRequest(BaseModel):
     """归档设备批次链的连续前缀。
 

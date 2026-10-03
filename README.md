@@ -49,7 +49,18 @@
 首次受理时刻/响应与重放统计；链头摘要与后续上传不变。重复或更小目标幂等，
 `archived_through` 只进不退。已归档批次仍可按摘要接受**同载荷重放**并累计重放
 次数（载荷变化仍 409）；归档之后登记的新消费者从 `archived_through` 起步，
-其首个缺口直接指向归档前缀的下一批。
+其首个缺口直接指向归档前缀的下一批。**归档不会清除仍被处理租约占用的明细**
+（见下节）。
+
+已登记消费者可以领取**批次处理租约**（`POST /field-devices/{device_id}/leases`），
+不再需要各处理进程自行挑批次、重复读取同一设备链：请求提交设备、消费者、
+最多 20 个批次、1～3600 秒租约期与幂等键，服务在**一个 SQLite 写事务**内从
+该消费者连续水位的下一批开始选择**未归档的连续区间**，保存租约及每批摘要并
+返回各批观测明细。同一消费者存在未终结租约时，同幂等键重试返回原租约，其他
+键返回 409；同一区间绝不会分给两个租约。完成租约
+（`POST …/leases/{id}/complete`）在同一事务逐项核对摘要、写入确认、推进水位
+并释放租约——摘要变化、缺批次或租约过期整体拒绝且不推进。过期租约可显式回收
+（`POST …/leases/{id}/recycle`）后重新领取。
 
 连续批次在归档前可形成一次**可复核的巡检判定**
 （`POST /field-devices/{device_id}/batch-judgments`）：请求携带客户端幂等键与
@@ -128,7 +139,12 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `POST` | `/field-devices/{device_id}/consumers` | 登记设备的必需下游消费者（不可删除；重复登记幂等；归档后登记从 `archived_through` 起步） |
 | `POST` | `/field-devices/{device_id}/acknowledgments` | 消费者确认已处理批次（`consumer_id`/`sequence`/`batch_digest`；乱序/并发/重复安全，冲突 409） |
 | `GET` | `/field-devices/{device_id}/archive-status` | 查询安全归档水位：`safe_sequence`、`archived_through`、首个缺口、各消费者水位与阻塞消费者 |
-| `POST` | `/field-devices/{device_id}/archive` | 归档连续前缀：清空 `sequence ≤ through_sequence` 的明细载荷（目标须 ≤ 同事务 `safe_sequence`，越界 409；重复/更小目标幂等） |
+| `POST` | `/field-devices/{device_id}/archive` | 归档连续前缀：清空 `sequence ≤ through_sequence` 的明细载荷（目标须 ≤ 同事务 `safe_sequence`，且不得覆盖未终结租约占用的批次；越界 409；重复/更小目标幂等） |
+| `POST` | `/field-devices/{device_id}/leases` | 领取批次处理租约：从消费者连续水位下一批起租至多 20 个未归档连续批次（幂等键；同键重试 200 返回原租约，其他键 409；无可领批次返回 `no_batches_available`） |
+| `POST` | `/field-devices/{device_id}/leases/{id}/complete` | 完成租约：逐项核对摘要，同事务写确认、推进水位并释放（摘要变化/缺批次/过期整体 409 且不推进；重复完成幂等） |
+| `POST` | `/field-devices/{device_id}/leases/{id}/recycle` | 显式回收已过期租约，使其区间可重新领取（未过期 409；重复回收幂等） |
+| `GET` | `/field-devices/{device_id}/leases` | 查询设备租约（可按 `consumer_id` 过滤、`active_only=true` 只看未终结租约） |
+| `GET` | `/field-devices/{device_id}/leases/{id}` | 查询单个租约详情（每批摘要；未终结租约附观测明细，已终结租约明细为 `null`） |
 | `POST` | `/field-devices/{device_id}/batch-judgments` | 对连续批次区间创建归档前巡检判定（幂等键；固定激活库版本，合并观测复用 `/judge`；重试 200，改范围/设备 409，含墓碑/缺批次/阈值不一致整体拒绝） |
 | `GET` | `/field-devices/{device_id}/batch-judgments` | 分页查询设备的连续批次判定（`after_id` 游标 + `limit`） |
 | `GET` | `/field-devices/{device_id}/batch-judgments/{id}` | 查询单次连续批次判定详情（不可变来源：序号范围、各批摘要、合并观测、阈值、`library_version`、判定结果） |
@@ -334,8 +350,10 @@ curl -s "$BASE/changes?include_skipped=true"
 「建新表 → 拷数据 → 改名」在单事务内重建，唯一约束保留）、为设备链游标表
 补充 `last_event_status` / `last_event_sequence` / `last_event_at` 列
 （回填为链头批次的受理事件）与 `archived_through` / `archived_at` 列
-（回填为 0 / 空）。全新部署则无初始版本，首次 `/library/import` 即创建
-版本 1。
+（回填为 0 / 空）。批次处理租约表（`batch_leases` /
+`batch_lease_batches`，含「每消费者至多一个 active 租约」的部分唯一索引）
+由建表语句在启动时自动补齐，既有库无需手工迁移。全新部署则无初始版本，
+首次 `/library/import` 即创建版本 1。
 
 ### 3. 判定观测序列
 
@@ -770,6 +788,178 @@ curl -s -X POST $DEV/archive -H 'Content-Type: application/json' \
 列表、详情、游标与 `archive-status` 均返回 `archived_through`；墓碑在列表
 与详情中均明确标注 `status="archived"`（另有布尔字段 `archived`）。
 
+### 8.5 已登记消费者批次处理租约（领取 → 处理 → 完成，过期可回收）
+
+下游消费者此前只能自行挑批次确认，多个处理进程会重复读取同一设备链。
+登记为必需消费者后，可以领取**批次处理租约**：服务端从该消费者**连续水位
+的下一批**起，把一段**未归档的连续区间**在单个写事务内只分给这一个租约，
+并直接返回各批观测明细，处理进程按摘要核对后一次完成即可。
+
+**领取请求**（`POST /field-devices/{device_id}/leases`）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `consumer_id` | `string` | 已登记的必需消费者编号（未登记返回 409 `consumer_not_registered`） |
+| `max_batches` | `int`（1～20） | 本次最多领取的批次数 |
+| `lease_seconds` | `int`（1～3600） | 租约有效期（秒）；到期后完成请求将被拒绝 |
+| `idempotency_key` | `string`（1~128） | 客户端幂等键（全局唯一；网络重试复用同一键） |
+
+区间选择规则：从 `max(watermark, archived_through) + 1` 开始，遇到缺批次、
+归档墓碑或链头即停，返回至多 `max_batches` 个连续未归档批次。租约保存
+`from_sequence` / `to_sequence` 与**每批摘要**（序号、`batch_id`、前序/本批
+摘要、条数），响应中每批另附观测时间戳与四项阈值——消费者无需再调批次
+详情接口。
+
+```bash
+DEV=http://localhost:8000/field-devices/dev-01
+
+# ① 登记消费者（必需消费者，见 §7）
+curl -s -X POST $DEV/consumers -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "analyzer"}'
+
+# ② 领取租约：至多 20 批、有效期 300 秒
+curl -s -X POST $DEV/leases -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "analyzer", "max_batches": 20,
+       "lease_seconds": 300, "idempotency_key": "analyzer-2026-10-03-001"}'
+```
+
+```json
+{
+  "status": "leased",
+  "lease_id": 1,
+  "idempotency_key": "analyzer-2026-10-03-001",
+  "device_id": "dev-01",
+  "consumer_id": "analyzer",
+  "lease_status": "active",
+  "from_sequence": 1,
+  "to_sequence": 3,
+  "batch_count": 3,
+  "lease_seconds": 300,
+  "created_at": "2026-10-03T06:00:00+00:00",
+  "expires_at": "2026-10-03T06:05:00+00:00",
+  "expired": false,
+  "watermark": 0,
+  "head_sequence": 5,
+  "archived_through": 0,
+  "batches": [
+    {"sequence": 1, "batch_id": "b-001", "previous_digest": "",
+     "digest": "49740f…", "observation_count": 3,
+     "observations": [{"captured_at": 1700000000.0, "local_id": "o000"}, "…"],
+     "thresholds": {"tolerance": 0.5, "max_drift": 0.0005,
+                    "max_missed": 3, "max_false": 3}},
+    {"sequence": 2, "batch_id": "b-002", "…": "…"},
+    {"sequence": 3, "batch_id": "b-003", "…": "…"}
+  ]
+}
+```
+
+水位之后暂时没有可领取批次时（已追平链头，或下一批是墓碑/缺口），**不创建
+租约**，HTTP 201 返回 `"status": "no_batches_available"`、`lease_id=null`、
+`batches=[]` 与 `next_sequence`，消费者稍后轮询重试即可。
+
+**幂等与冲突（409）**：同一消费者存在**未终结租约**（active，含已过期但未
+回收）期间：
+
+- **相同幂等键重试**返回原租约，HTTP 200、`lease_id`/区间/到期时刻均不变
+  （租约已过期时响应中 `expired=true`，同样原样返回）；
+- **其他幂等键**返回 409：未过期 `reason=lease_active`，已过期
+  `reason=lease_expired`，`detail` 附现有租约 id、区间与 `expires_at`；
+- 幂等键被其他租约（含已完成/已回收的历史租约）占用：409
+  `reason=idempotency_key_in_use`，附 `occupied_by_lease_id`。
+
+写锁（`BEGIN IMMEDIATE`）加 `(device_id, consumer_id)` 上的部分唯一索引
+（`WHERE status='active'`）兜底并发：同一消费者的并发领取恰好一份 201，
+其余全部 409，**同一区间绝不会分给两个租约**。不同消费者互不影响，可以
+各自独立租到同一区间。
+
+**完成租约**：处理完租约内**全部**批次后，逐项提交 `(sequence,
+batch_digest)`（摘要取自领取响应）。服务在**同一个写事务**内：
+
+1. 校验租约属于该设备/消费者、仍处于 active 且**未过期**；
+2. 逐项核对提交集合恰好覆盖 `from_sequence..to_sequence`（缺批次报
+   `missing_sequences`、多批次报 `unexpected_sequences`），且每项摘要等于
+   服务端当前批次摘要（不符报 `digest_mismatch`，附 `expected_digest`）；
+3. 全部通过才写入稀疏确认、把连续水位推进至首个缺口、租约置 `completed`
+   并释放（该消费者随后可领取下一租约）。
+
+任一项不满足都会**整体拒绝**：不写任何确认、水位不推进、租约保持 active。
+
+```bash
+# ③ 用领取响应中的 digest 逐项完成（摘要变化/缺批次/过期会整体 409）
+curl -s -X POST $DEV/leases/1/complete -H 'Content-Type: application/json' -d '{
+  "consumer_id": "analyzer",
+  "items": [
+    {"sequence": 1, "batch_digest": "49740f…"},
+    {"sequence": 2, "batch_digest": "5e7aa3…"},
+    {"sequence": 3, "batch_digest": "9c10bd…"}
+  ]
+}'
+# → 201 {"status": "completed", "lease_status": "completed",
+#        "from_sequence": 1, "to_sequence": 3, "watermark": 3,
+#        "safe_sequence": 3, "first_gap": 4,
+#        "blocking_consumers": [], "completed_at": "…", "batches": [ … ]}
+```
+
+- 重复完成同一租约幂等：HTTP 200，保留首次 `completed_at`；
+- 租约已过期时完成返回 409 `lease_expired`（**不静默推进**）；租约已被回收
+  返回 409 `lease_recycled`；消费者不匹配返回 409 `lease_consumer_mismatch`；
+- 完成即写入的是与 §7 相同的稀疏确认，所以 `safe_sequence`、
+  `archive-status` 与乱序确认语义完全一致；也可以继续用
+  `POST /acknowledgments` 做租约之外的单批确认。
+
+**冲突示例（409）**：
+
+```json
+// 租约未结束就换一个幂等键再领
+{"detail": {"error": "lease_conflict", "reason": "lease_active",
+  "message": "consumer 'analyzer' already has an active lease 1 …",
+  "active_lease_id": 1, "active_lease_status": "active",
+  "active_from_sequence": 1, "active_to_sequence": 3,
+  "active_expires_at": "2026-10-03T06:05:00+00:00"}}
+
+// 完成时某项摘要与服务端不一致 → 整体拒绝、不推进
+{"detail": {"error": "lease_conflict", "reason": "digest_mismatch",
+  "lease_id": 1, "sequence": 2,
+  "provided_digest": "abab…", "expected_digest": "5e7aa3…"}}
+```
+
+**过期与回收**：租约到期后不会自动释放占用——这保证处理较慢的进程不会
+在租约到期瞬间与新领取者产生区间重叠。确认原进程已停手后，**显式回收**
+过期租约，区间即可被重新领取（重新领取时仍从该消费者当前水位的下一批
+开始，已确认的批次不会重复）：
+
+```bash
+# 未过期回收 → 409 lease_not_expired；已过期 → 200 recycled
+curl -s -X POST $DEV/leases/1/recycle -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "analyzer"}'
+# → 200 {"status": "recycled", "lease_status": "recycled",
+#        "recycled_at": "…", …}
+# 重复回收幂等（HTTP 200）；已完成租约回收 → 409 lease_not_active
+
+# 回收后用新幂等键重新领取
+curl -s -X POST $DEV/leases -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "analyzer", "max_batches": 20,
+       "lease_seconds": 300, "idempotency_key": "analyzer-2026-10-03-002"}'
+```
+
+**归档与租约占用**：归档在同一写事务内额外检查——任何**未终结租约**
+（active，**含已过期但尚未回收**）覆盖待归档区间即返回 409
+`reason=leases_occupying_batches`，`detail.occupied_leases` 列出占用方
+（`lease_id`/`consumer_id`/区间/`expires_at`/`expired`）。因此租约内批次
+的观测与阈值明细在完成或回收前绝不会被清除；租约只占用区间而不改变
+`safe_sequence`（水位仍只由确认推进），不重叠的前缀（如租约占用 3..4 时
+归档 1..2）照常归档。
+
+**租约查询**：
+
+```bash
+# 设备全部租约；可按消费者过滤，或只看未终结租约
+curl -s "$DEV/leases?consumer_id=analyzer&active_only=true"
+# 单个租约：active 租约附观测明细；completed/recycled 租约的明细为 null，
+# 每批摘要（digest/observation_count）始终保留
+curl -s "$DEV/leases/1"
+```
+
 ### 9. 连续批次归档前巡检判定（一次可复核的判定来源）
 
 现场设备上传的连续批次在**归档之前**，可按设备与起止 `sequence` 形成一次
@@ -923,6 +1113,7 @@ curl -s -X POST $DEV/verify-chain \
   "archived_batches": 3,
   "checked_acknowledgments": 14,
   "checked_judgment_sources": 4,
+  "checked_lease_batches": 6,
   "snapshot": {
     "head_sequence": 12,
     "head_digest": "9c10bd…",
@@ -930,7 +1121,8 @@ curl -s -X POST $DEV/verify-chain \
     "archived_through": 3,
     "safe_sequence": 9,
     "consumer_count": 2,
-    "batch_judgment_count": 2
+    "batch_judgment_count": 2,
+    "active_lease_count": 1
   }
 }
 ```
@@ -952,6 +1144,9 @@ curl -s -X POST $DEV/verify-chain \
 - **消费者**：每条确认保存的 `batch_digest` 必须等于该批次当前摘要；水位
   不得越过链头、不得低于 `archived_through`，且必须已按稀疏确认推进到
   首个缺口（乱序确认形成的合法缺口不报问题）；
+- **批次处理租约**：`batch_lease_batches` 保存的各批摘要/`batch_id`/条数
+  必须与当前批次一致，租约保存的区间必须连续完整，active 租约占用的批次
+  不得已是归档墓碑，任意两个 active 租约区间不得重叠；
 - **连续批次判定来源**：`batch_judgment_batches` 保存的各批
   `digest` / `previous_digest` / `batch_id` / `observation_count` 必须与
   当前批次一致。
@@ -993,6 +1188,8 @@ curl -s -X POST $DEV/verify-chain \
 | `tombstone_status_mismatch` / `tombstone_details_present` | 墓碑骨架不一致：状态列与归档时刻矛盾 / 明细未清空 |
 | `ack_digest_mismatch` / `ack_batch_missing` | 确认摘要与批次当前摘要不符 / 确认指向不存在的批次 |
 | `watermark_beyond_head` / `watermark_below_archived_through` / `watermark_not_advanced` | 水位越过链头 / 低于归档水位 / 未按稀疏确认推进到首个缺口 |
+| `lease_digest_mismatch` / `lease_batch_missing` / `lease_batch_id_mismatch` / `lease_observation_count_mismatch` | 租约保存的批次摘要（或批次本身/编号/条数）与当前批次不一致 |
+| `lease_range_incomplete` / `active_lease_overlap` / `active_lease_batch_archived` | 租约保存区间不完整 / 两个 active 租约区间重叠 / active 租约占用的批次已被归档为墓碑 |
 | `judgment_source_digest_mismatch` 等 | 连续批次判定来源保存的摘要（或 `previous_digest`/`batch_id`/`observation_count`）与当前批次不一致；来源批次缺失为 `judgment_source_batch_missing` |
 
 **错误响应（4xx）**：
@@ -1058,7 +1255,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 草稿回放 + 连续批次判定 + 链一致性核验共 160 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 消费者批次处理租约 + 草稿回放 + 连续批次判定 + 链一致性核验共 192 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 
@@ -1074,6 +1271,7 @@ app/
   models.py  请求数据模型（Pydantic）
   db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 草稿回放报告 +
              设备批次链 + 多消费者稀疏确认与安全归档水位 + 连续前缀归档墓碑 +
+             已登记消费者批次处理租约（领取/完成/回收/查询） +
              连续批次归档前巡检判定不可变来源 + 只读快照链一致性核验，含首次迁移）
   config.py  环境变量配置
 samples/
